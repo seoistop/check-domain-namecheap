@@ -3,6 +3,7 @@ import asyncio
 import os
 from pathlib import Path
 from datetime import datetime
+import requests
 
 from telegram import Update, InputFile
 from telegram.constants import ChatAction
@@ -25,6 +26,20 @@ HELP_TEXT = (
     "- NAMECHEAP_API_USER, NAMECHEAP_USERNAME, NAMECHEAP_API_KEY, NAMECHEAP_CLIENT_IP\n"
     "- (Tuỳ chọn) USE_SANDBOX=1 để dùng sandbox\n"
 )
+
+def log_current_ip():
+    """Log current outbound IP for Namecheap whitelist"""
+    try:
+        response = requests.get('https://api.ipify.org?format=json', timeout=5)
+        ip = response.json()['ip']
+        print("=" * 60)
+        print(f"🌐 CURRENT OUTBOUND IP: {ip}")
+        print(f"🔑 Add this IP to Namecheap whitelist: {ip}")
+        print("=" * 60)
+        return ip
+    except Exception as e:
+        print(f"⚠️ Cannot get current IP: {e}")
+        return None
 
 def _check_config_ready() -> bool:
     ok = all([
@@ -119,6 +134,9 @@ def main():
     if not BOT_TOKEN:
         print("⛔ Chưa thiết lập BOT_TOKEN")
         return
+
+    # Log current IP when bot starts
+    log_current_ip()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
