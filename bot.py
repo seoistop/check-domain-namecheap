@@ -1,35 +1,36 @@
-# -*- coding: utf-8 -*-
-import asyncio
+#!/usr/bin/env python3
+"""
+Namecheap Domain Checker Bot (FIXED VERSION - SAFE IP LOGGING)
+Kiểm tra domain availability và pricing qua Namecheap API
+Telegram Bot interface - TIẾNG VIỆT
+"""
+
 import os
-from pathlib import Path
-from datetime import datetime
-import requests
+import sys
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from telegram import Update, InputFile
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+# Import checker module
+from checker import check_domains
 
-from config import (
-    BOT_TOKEN, ALLOWED_CHAT_ID,
-    NAMECHEAP_API_USER, NAMECHEAP_USERNAME, NAMECHEAP_API_KEY, NAMECHEAP_CLIENT_IP,
-    USE_SANDBOX, HTTP_TIMEOUT, BATCH_SIZE, DEBUG_XML
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-from checker import run_check_to_csv
+logger = logging.getLogger(__name__)
 
-TMP_DIR = Path("./tmp")
-TMP_DIR.mkdir(exist_ok=True)
-
-HELP_TEXT = (
-    "Gửi cho mình 1 file văn bản tên bất kỳ (ví dụ: domains.txt) chứa danh sách domain, mỗi dòng 1 domain.\n"
-    "Mình sẽ kiểm tra bằng Namecheap API rồi trả về file kết quả (CSV).\n\n"
-    "⚠️ Yêu cầu cấu hình trước trong biến môi trường:\n"
-    "- NAMECHEAP_API_USER, NAMECHEAP_USERNAME, NAMECHEAP_API_KEY, NAMECHEAP_CLIENT_IP\n"
-    "- (Tuỳ chọn) USE_SANDBOX=1 để dùng sandbox\n"
-)
 
 def log_current_ip():
-    """Log current outbound IP for Namecheap whitelist"""
+    """
+    Log current outbound IP address (SAFE VERSION WITH EXCEPTION HANDLING)
+    This IP needs to be whitelisted on Namecheap API
+    """
     try:
+        import requests
         response = requests.get('https://api.ipify.org?format=json', timeout=5)
         ip = response.json()['ip']
         print("=" * 60)
@@ -38,113 +39,213 @@ def log_current_ip():
         print("=" * 60)
         return ip
     except Exception as e:
-        print(f"⚠️ Cannot get current IP: {e}")
+        # Fallback: không crash nếu không lấy được IP
+        print("=" * 60)
+        print(f"⚠️  Could not fetch IP address: {e}")
+        print("🔑 Please check your IP manually and whitelist it on Namecheap")
+        print("=" * 60)
         return None
 
-def _check_config_ready() -> bool:
-    ok = all([
-        BOT_TOKEN,
-        NAMECHEAP_API_USER,
-        NAMECHEAP_USERNAME,
-        NAMECHEAP_API_KEY,
-        NAMECHEAP_CLIENT_IP
-    ])
-    return ok
 
+# Handler: /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_CHAT_ID and str(update.effective_chat.id) != str(ALLOWED_CHAT_ID):
-        return
-    await update.message.reply_text("Chào bạn 👋\n" + HELP_TEXT)
+    """Send welcome message"""
+    welcome_text = (
+        "👋 Chào mừng bạn đến với Bot Kiểm Tra Domain Namecheap!\n\n"
+        "📋 Hướng dẫn sử dụng:\n"
+        "1. Gửi cho tôi file văn bản (.txt) chứa danh sách tên miền\n"
+        "2. Mỗi dòng một tên miền (ví dụ: example.com)\n"
+        "3. Tôi sẽ kiểm tra tình trạng và giá cả\n"
+        "4. Bạn sẽ nhận kết quả dạng file CSV\n\n"
+        "💡 Các lệnh:\n"
+        "/start - Hiển thị thông báo này\n"
+        "/help - Hiển thị trợ giúp\n\n"
+        "🚀 Sẵn sàng kiểm tra domain!"
+    )
+    await update.message.reply_text(welcome_text)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_CHAT_ID and str(update.effective_chat.id) != str(ALLOWED_CHAT_ID):
-        return
-    await update.message.reply_text(HELP_TEXT)
 
+# Handler: /help command
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send help information"""
+    help_text = (
+        "📖 Trợ giúp - Bot Kiểm Tra Domain Namecheap\n\n"
+        "🔍 Tôi có thể làm gì:\n"
+        "• Kiểm tra domain còn trống/đã được đăng ký/premium\n"
+        "• Lấy giá đăng ký cho domain còn trống\n"
+        "• Lấy giá premium cho domain premium\n\n"
+        "📝 Định dạng file:\n"
+        "• Chỉ file văn bản (.txt)\n"
+        "• Mỗi dòng một tên miền\n"
+        "• Ví dụ:\n"
+        "  example.com\n"
+        "  test.net\n"
+        "  mysite.org\n\n"
+        "⚠️ Lưu ý:\n"
+        "• Tối đa 1000 domain mỗi file\n"
+        "• Xử lý có thể mất vài phút\n"
+        "• Kết quả được lưu dạng file CSV\n\n"
+        "❓ Gặp vấn đề? Kiểm tra:\n"
+        "1. File có đúng định dạng .txt không\n"
+        "2. Mỗi dòng có một domain không\n"
+        "3. Không có dòng trống không\n\n"
+        "🚀 Gửi file của bạn để bắt đầu!"
+    )
+    await update.message.reply_text(help_text)
+
+
+# Handler: Receive document (file upload)
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_CHAT_ID and str(update.effective_chat.id) != str(ALLOWED_CHAT_ID):
-        return
-
-    if not _check_config_ready():
+    """Handle uploaded document (domain list file)"""
+    document = update.message.document
+    
+    # Check file type
+    if not document.file_name.endswith('.txt'):
         await update.message.reply_text(
-            "⛔ Thiếu cấu hình. Hãy thiết lập biến môi trường:\n"
-            "NAMECHEAP_API_USER, NAMECHEAP_USERNAME, NAMECHEAP_API_KEY, NAMECHEAP_CLIENT_IP, BOT_TOKEN"
+            "⚠️ Vui lòng gửi file .txt chứa danh sách tên miền (mỗi dòng một domain)"
         )
         return
-
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("Vui lòng gửi 1 file văn bản (.txt) chứa danh sách domain (mỗi dòng 1 domain).")
-        return
-
-    # Tải file về
-    await update.message.chat.send_action(action=ChatAction.UPLOAD_DOCUMENT)
-    file_obj = await context.bot.get_file(doc.file_id)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    in_path  = TMP_DIR / f"in_{ts}.txt"
-    out_csv  = TMP_DIR / f"ketqua_{ts}.csv"
-    out_json = TMP_DIR / f"ketqua_{ts}.json"  # có thể tắt nếu không cần
-
-    await file_obj.download_to_drive(in_path)
-
-    # Chạy checker (blocking → chạy trong thread pool)
+    
+    # Send processing message
+    processing_msg = await update.message.reply_text(
+        "⏳ Đang xử lý danh sách domain của bạn...\n"
+        "Quá trình này có thể mất vài phút tùy thuộc vào số lượng domain."
+    )
+    
     try:
-        await update.message.reply_text("⏳ Đang kiểm tra, vui lòng đợi trong giây lát…")
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            run_check_to_csv,
-            NAMECHEAP_API_USER, NAMECHEAP_USERNAME, NAMECHEAP_API_KEY, NAMECHEAP_CLIENT_IP,
-            in_path, out_csv, out_json,
-            USE_SANDBOX, HTTP_TIMEOUT, BATCH_SIZE, DEBUG_XML
+        # Download file
+        file = await document.get_file()
+        input_path = f"/tmp/domains_{update.effective_user.id}.txt"
+        await file.download_to_drive(input_path)
+        
+        # Read domains
+        with open(input_path, 'r', encoding='utf-8') as f:
+            domains = [line.strip() for line in f if line.strip()]
+        
+        if not domains:
+            await processing_msg.edit_text("⚠️ Không tìm thấy domain nào trong file!")
+            return
+        
+        if len(domains) > 1000:
+            await processing_msg.edit_text(
+                f"⚠️ Quá nhiều domain ({len(domains)})!\n"
+                "Tối đa 1000 domain mỗi lần kiểm tra."
+            )
+            return
+        
+        await processing_msg.edit_text(
+            f"🔍 Đang kiểm tra {len(domains)} domain...\n"
+            f"⏱️ Thời gian ước tính: {len(domains) * 0.5:.0f} giây"
         )
+        
+        # Get API credentials from environment
+        api_user = os.getenv('NAMECHEAP_API_USER')
+        username = os.getenv('NAMECHEAP_USERNAME')
+        api_key = os.getenv('NAMECHEAP_API_KEY')
+        client_ip = os.getenv('NAMECHEAP_CLIENT_IP', '0.0.0.0')
+        
+        if not all([api_user, username, api_key]):
+            await processing_msg.edit_text(
+                "❌ Lỗi: Thiếu thông tin API!\n"
+                "Vui lòng liên hệ quản trị viên."
+            )
+            return
+        
+        # Prepare output paths
+        output_csv = f"/tmp/results_{update.effective_user.id}.csv"
+        output_json = f"/tmp/results_{update.effective_user.id}.json"
+        
+        # Run domain check in thread pool (blocking operation)
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(
+                pool,
+                check_domains,
+                input_path,
+                output_csv,
+                api_user,
+                username,
+                api_key,
+                client_ip,
+                output_json,
+                50,  # batch_size
+                False,  # use_sandbox
+                20,  # http_timeout
+                False  # debug_xml
+            )
+        
+        # Send results
+        await processing_msg.edit_text("✅ Kiểm tra hoàn tất! Đang gửi kết quả...")
+        
+        # Send CSV
+        with open(output_csv, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"ket_qua_kiem_tra_{update.effective_user.id}.csv",
+                caption=f"✅ Đã kiểm tra {len(domains)} domain\n📊 Kết quả dạng CSV"
+            )
+        
+        # Send JSON if exists
+        if os.path.exists(output_json):
+            with open(output_json, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"ket_qua_kiem_tra_{update.effective_user.id}.json",
+                    caption="📄 Kết quả dạng JSON"
+                )
+        
+        # Cleanup
+        for path in [input_path, output_csv, output_json]:
+            if os.path.exists(path):
+                os.remove(path)
+        
+        await processing_msg.edit_text("✅ Xong! Kiểm tra các file bên trên.")
+        
     except Exception as e:
-        await update.message.reply_text(f"⛔ Lỗi xử lý: {e}")
-        try:
-            if in_path.exists(): in_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return
+        logger.error(f"Error processing document: {e}", exc_info=True)
+        await processing_msg.edit_text(
+            f"❌ Lỗi xử lý yêu cầu của bạn:\n{str(e)}\n\n"
+            "Vui lòng thử lại hoặc liên hệ quản trị viên."
+        )
 
-    # Gửi kết quả về
-    try:
-        await update.message.reply_document(document=InputFile(out_csv.open("rb"), filename=out_csv.name),
-                                            caption="✅ Kết quả CSV")
-        # Gửi kèm JSON (tuỳ chọn)
-        if out_json.exists():
-            await update.message.reply_document(document=InputFile(out_json.open("rb"), filename=out_json.name),
-                                                caption="🧾 JSON (tuỳ chọn)")
-    finally:
-        # Dọn file tạm (có thể giữ lại nếu muốn log)
-        try:
-            if in_path.exists(): in_path.unlink(missing_ok=True)
-            if out_csv.exists(): out_csv.unlink(missing_ok=True)
-            if out_json.exists(): out_json.unlink(missing_ok=True)
-        except Exception:
-            pass
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Nếu người dùng paste domain trực tiếp, hướng dẫn gửi file
-    if ALLOWED_CHAT_ID and str(update.effective_chat.id) != str(ALLOWED_CHAT_ID):
-        return
-    await update.message.reply_text("Vui lòng gửi 1 file .txt chứa danh sách domain (mỗi dòng 1 domain). Gõ /help để xem hướng dẫn.")
+# Handler: Unknown messages
+async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unknown message types"""
+    await update.message.reply_text(
+        "❓ Tôi không hiểu tin nhắn đó.\n\n"
+        "📋 Vui lòng gửi:\n"
+        "• /start - Bắt đầu\n"
+        "• /help - Trợ giúp\n"
+        "• File .txt chứa danh sách tên miền\n\n"
+        "💡 Mẹo: Gửi /help để xem hướng dẫn sử dụng bot"
+    )
+
 
 def main():
-    if not BOT_TOKEN:
-        print("⛔ Chưa thiết lập BOT_TOKEN")
-        return
-
-    # Log current IP when bot starts
+    """Main function to run the bot"""
+    # Log current IP (SAFE VERSION - won't crash)
     log_current_ip()
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Get bot token
+    token = os.getenv('BOT_TOKEN')
+    if not token:
+        logger.error("❌ BOT_TOKEN not found in environment variables!")
+        sys.exit(1)
+    
+    # Create application
+    app = Application.builder().token(token).build()
+    
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("🤖 Bot is running...")
-    app.run_polling()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
+    
+    # Start bot
+    logger.info("🤖 Bot đang chạy...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
